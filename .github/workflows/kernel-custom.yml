@@ -72,10 +72,31 @@ on:
           - Official
           #- Next
           - SukiSU
+          - SukiSUNova
           - SukiSU(40726)
           - SukiSU(40548)
           - ReSukiSU
         default: ReSukiSU
+
+      # ==================== SukiSU Nova 配置 ====================
+      nova_source:
+        description: "Nova 仓库 owner/repo（仅 kernelsu_variant=SukiSUNova 时生效）"
+        required: false
+        type: string
+        default: "SukiSU-Nova/SukiSU-Nova"
+      nova_branch:
+        description: "Nova 分支：main(kprobe，可编模块) / builtin(纯内置 hook)"
+        required: false
+        type: choice
+        options:
+          - main
+          - builtin
+        default: main
+      nova_ref:
+        description: "Nova 的 tag/commit（留空=分支最新）"
+        required: false
+        type: string
+        default: ""
 
       # ==================== 可选配置 ====================
       version:
@@ -166,6 +187,9 @@ jobs:
       custom_kernel_source: ${{ inputs.custom_kernel_source || '' }}
       custom_kernel_branch: ${{ inputs.custom_kernel_branch || '' }}
       custom_kernel_subdir: ${{ inputs.custom_kernel_subdir || '' }}
+      nova_source: ${{ inputs.nova_source || 'SukiSU-Nova/SukiSU-Nova' }}
+      nova_branch: ${{ inputs.nova_branch || 'main' }}
+      nova_ref: ${{ inputs.nova_ref || '' }}
 
   get-ksu-manager:
     uses: ./.github/workflows/get-manager.yml
