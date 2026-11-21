@@ -82,6 +82,9 @@ jobs:
           elif [ "${{ inputs.kernelsu_variant }}" == "ReSukiSU" ]; then
             echo "This is the ReSukiSU variant"
             git clone https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          elif [ "${{ inputs.kernelsu_variant }}" == "SukiSUNova" ]; then
+            echo "This is the SukiSUNova variant"
+            git clone --depth 1 https://github.com/SukiSU-Nova/SukiSU-Nova.git KernelSU
           elif [ "${{ inputs.kernelsu_variant }}" == "Official" ]; then
             echo "This is the Official"
             git clone https://github.com/tiann/KernelSU.git KernelSU
@@ -107,6 +110,10 @@ jobs:
             KSU_VERSION=$((20000 + KSU_GIT_VERSION))
           elif [ "${{ inputs.kernelsu_variant }}" == "Next" ]; then
             KSU_VERSION=$((30000 + KSU_GIT_VERSION))
+          elif [ "${{ inputs.kernelsu_variant }}" == "SukiSUNova" ]; then
+            # Nova 自己的版本基数（kernel/Makefile 里 VERSION_BASE 30000 +
+            # VERSION_OFFSET 4001 的算法不同，这里只用提交数做区分标识）
+            KSU_VERSION=$((50000 + KSU_GIT_VERSION))
           fi
           echo $KSU_VERSION
           echo "KSU_VERSION=$KSU_VERSION" >> $GITHUB_ENV
@@ -130,6 +137,30 @@ jobs:
         id: add_KSU
         continue-on-error: true
         run: |
+          # SukiSU Nova 直接从 GitHub Release 取预编译 APK。
+          # 它的 manager 构建用自定义 ci_artifact_put，artifact 名是动态的
+          # （<title>-gradle），下面那套按 workflow 名轮询的逻辑对不上。
+          if [ "${{ inputs.kernelsu_variant }}" == "SukiSUNova" ]; then
+            echo "从 SukiSU-Nova Release 下载管理器 APK..."
+            mkdir -p "manager-artifacts/SukiSUNova"
+            REL_JSON=$(curl -fsSL "https://api.github.com/repos/SukiSU-Nova/SukiSU-Nova/releases/latest")
+            TAG=$(echo "$REL_JSON" | jq -r '.tag_name')
+            APK_URL=$(echo "$REL_JSON" | jq -r '
+              .assets[] | select(.name | test("arm64-v8a.*\\.apk$")) | .browser_download_url' | head -n 1)
+            if [ -z "$APK_URL" ] || [ "$APK_URL" = "null" ]; then
+              echo "未在 Release 中找到 arm64-v8a APK，列出全部 assets："
+              echo "$REL_JSON" | jq -r '.assets[].name'
+              exit 1
+            fi
+            APK_NAME=$(basename "$APK_URL")
+            echo "  tag: $TAG"
+            echo "  apk: $APK_NAME"
+            curl -fL -o "manager-artifacts/SukiSUNova/$APK_NAME" "$APK_URL"
+            echo "  已下载: manager-artifacts/SukiSUNova/$APK_NAME"
+            echo "KSU_VERSION=${TAG#v}" >> $GITHUB_ENV
+            exit 0
+          fi
+
           case "${{ inputs.kernelsu_variant }}" in
             "SukiSU(40726)") LEGACY_RELEASE_TAG="v2.1.0-r2"; LEGACY_DIR="SukiSU_40726" ;;
             "SukiSU(40548)") LEGACY_RELEASE_TAG="v2.0.0-r34"; LEGACY_DIR="SukiSU_40548" ;;
@@ -161,6 +192,10 @@ jobs:
           elif [ "${{ inputs.kernelsu_variant }}" == "ReSukiSU" ]; then
             echo "ReSukiSU..."
             REPO="ReSukiSU/ReSukiSU"
+            KSUM="manager"
+          elif [ "${{ inputs.kernelsu_variant }}" == "SukiSUNova" ]; then
+            echo "SukiSUNova..."
+            REPO="SukiSU-Nova/SukiSU-Nova"
             KSUM="manager"
           elif [ "${{ inputs.kernelsu_variant }}" == "Official" ]; then
             echo "KSU..."
