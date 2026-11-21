@@ -89,6 +89,23 @@ on:
         type: string
         default: ""
 
+      # ==================== SukiSU Nova ====================
+      nova_source:
+        description: "SukiSU Nova 仓库 owner/repo（kernelsu_variant 选 SukiSUNova 时使用）"
+        required: false
+        type: string
+        default: "SukiSU-Nova/SukiSU-Nova"
+      nova_branch:
+        description: "Nova 分支：main(kprobe，可编模块) / builtin(纯内置)"
+        required: false
+        type: string
+        default: "main"
+      nova_ref:
+        description: "Nova 的 tag/commit（留空=分支最新）"
+        required: false
+        type: string
+        default: ""
+
 jobs:
   build-kernel:
     name: "${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ inputs.ksu_variant }}"
@@ -497,6 +514,10 @@ jobs:
             "Official"|"ReSukiSU")
               BRANCH="-s main"
               ;;
+            "SukiSUNova")
+              # Nova 分支由 nova_branch 决定：main(kprobe) / builtin(手动 hook)
+              BRANCH="-s ${{ inputs.nova_branch }}"
+              ;;
             "SukiSU")
               if [ "${{ inputs.enable_susfs }}" = "false" ]; then
                 BRANCH="-s main"
@@ -566,6 +587,74 @@ jobs:
             "ReSukiSU")
               echo "添加 ReSukiSU..."
               curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash $BRANCH
+              ;;
+            "SukiSUNova")
+              # 不能直接用 Nova 官方的 kernel/setup.sh：它内部从
+              #   https://git.zako.shirkneko.top:20004/shirkneko/SukiSU
+              # 这个非标准端口镜像克隆，GitHub Actions 上通常拉不动。
+              # 这里在本地实现等价动作：clone GitHub -> 软链 drivers/kernelsu
+              # -> 往 drivers/Makefile / drivers/Kconfig 加条目。
+              echo "添加 SukiSU Nova..."
+              NOVA_REPO="${{ inputs.nova_source }}"
+              NOVA_BR="${BRANCH#-s }"
+              [ -z "$NOVA_BR" ] && NOVA_BR="main"
+              echo "  仓库: $NOVA_REPO"
+              echo "  分支: $NOVA_BR"
+
+              rm -rf KernelSU
+              git clone --depth 1 -b "$NOVA_BR" "https://github.com/${NOVA_REPO}.git" KernelSU
+              if [ -n "${{ inputs.nova_ref }}" ]; then
+                git -C KernelSU fetch --depth 1 origin "${{ inputs.nova_ref }}"
+                git -C KernelSU checkout FETCH_HEAD
+              fi
+
+              # Nova 的 kernel/ 就是标准 KernelSU 内核模块源码
+              if [ ! -f KernelSU/kernel/Kconfig ]; then
+                echo "::error::Nova 仓库里找不到 kernel/Kconfig"
+                ls -1 KernelSU 2>/dev/null | head -20
+                exit 1
+              fi
+
+              # 定位 drivers 目录（GKI 是 common/drivers，常规内核是 drivers）
+              if [ -d "common/drivers" ]; then
+                DDIR="common/drivers"
+              elif [ -d "drivers" ]; then
+                DDIR="drivers"
+              else
+                echo "::error::找不到 drivers 目录"
+                exit 1
+              fi
+              echo "  drivers 目录: $DDIR"
+
+              # 软链 kernelsu -> KernelSU/kernel
+              rm -f "$DDIR/kernelsu"
+              REL="$(realpath --relative-to="$DDIR" "$PWD/KernelSU/kernel")"
+              ln -sfn "$REL" "$DDIR/kernelsu"
+              echo "  软链: $DDIR/kernelsu -> $REL"
+
+              # Makefile 条目
+              if grep -q 'kernelsu' "$DDIR/Makefile"; then
+                echo "  Makefile 已有 kernelsu 条目"
+              else
+                printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$DDIR/Makefile"
+                echo "  Makefile 已添加 obj-\$(CONFIG_KSU) += kernelsu/"
+              fi
+
+              # Kconfig 条目
+              if grep -q 'drivers/kernelsu/Kconfig' "$DDIR/Kconfig"; then
+                echo "  Kconfig 已有 kernelsu 条目"
+              else
+                sed -i '/^endmenu$/i\source "drivers/kernelsu/Kconfig"' "$DDIR/Kconfig"
+                echo "  Kconfig 已添加 source drivers/kernelsu/Kconfig"
+              fi
+
+              # 记录 Nova 版本，供后续步骤使用
+              if [ -d "KernelSU/.git" ]; then
+                NOVA_HASH=$(git -C KernelSU rev-parse --short=8 HEAD)
+                NOVA_TAG=$(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || echo "$NOVA_BR")
+                echo "NOVA_VERSION=$NOVA_TAG@$NOVA_HASH" >> $GITHUB_ENV
+                echo "  Nova 版本: $NOVA_TAG@$NOVA_HASH"
+              fi
               ;;
             *)
               if [ -z "$LEGACY_SUKISU_CONFIG" ]; then
@@ -662,6 +751,12 @@ jobs:
               ;;
             "Next"|"SukiSU"|"SukiSU(40726)"|"SukiSU(40548)"|"ReSukiSU")
               echo "Next/SukiSU/SukiSU(40726)/SukiSU(40548)/ReSukiSU 使用内置 SUSFS 支持"
+              ;;
+            "SukiSUNova")
+              # Nova 自带 kernel/extension/susfs_extension.c，通过内核源码里的
+              # SUSFS 符号工作，但没有 CONFIG_KSU_SUSFS 这个 Kconfig 开关，
+              # 所以不能套 Official 那份 10_enable_susfs_for_ksu.patch。
+              echo "SukiSUNova 使用自带 susfs_extension，跳过 KSU 侧补丁"
               ;;
           esac
 
@@ -816,7 +911,7 @@ jobs:
             fi
           fi
 
-          if [ "${{ inputs.ksu_variant }}" == "Official" ] || [ "${{ inputs.ksu_variant }}" == "Next" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40726)" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40548)" ] || [ "${{ inputs.ksu_variant }}" == "ReSukiSU" ]; then
+          if [ "${{ inputs.ksu_variant }}" == "Official" ] || [ "${{ inputs.ksu_variant }}" == "Next" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40726)" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40548)" ] || [ "${{ inputs.ksu_variant }}" == "ReSukiSU" ] || [ "${{ inputs.ksu_variant }}" == "SukiSUNova" ]; then
             # Android 12 - 5.10 修复
             if [[ "${{ inputs.android_version }}" == "android12" && "${{ inputs.kernel_version }}" == "5.10" ]]; then
               # 修复 2024-11 分支: mmap.c 调用了 vm_flags_clear()，但同分支 mm.h 未提供 helper
@@ -1319,7 +1414,7 @@ jobs:
           CONFIG_TMPFS_POSIX_ACL=y
           EOF
 
-          if [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40726)" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40548)" ] || [ "${{ inputs.ksu_variant }}" == "ReSukiSU" ] || [ "${{ inputs.ksu_variant }}" == "Next" ]; then
+          if [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40726)" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU(40548)" ] || [ "${{ inputs.ksu_variant }}" == "ReSukiSU" ] || [ "${{ inputs.ksu_variant }}" == "Next" ] || [ "${{ inputs.ksu_variant }}" == "SukiSUNova" ]; then
             if [[ "${{ inputs.use_kpm }}" == enabled* ]] || [[ "${{ inputs.use_kpm }}" == patched* ]]; then
               if ! grep -RqsE '^[[:space:]]*config[[:space:]]+KPM([[:space:]]|$)' common KernelSU 2>/dev/null; then
                 echo "错误: 已请求启用 KPM，但当前 KernelSU 代码未声明 CONFIG_KPM" >&2
@@ -1354,6 +1449,17 @@ jobs:
       - name: 添加 SUSFS 配置
         if: inputs.enable_susfs
         run: |
+          # Nova 没有 CONFIG_KSU_SUSFS 系列 Kconfig 符号（它在
+          # kernel/extension/susfs_extension.c 里直接引用内核 SUSFS 接口），
+          # 往 defconfig 写这些项是无意义的，跳过。
+          if grep -RqsE '^[[:space:]]*(config|menuconfig)[[:space:]]+KSU_SUSFS([[:space:]]|$)' \
+               ./KernelSU/kernel/Kconfig ./common 2>/dev/null; then
+            : # 有定义，正常写入
+          else
+            echo "当前 KernelSU 代码未声明 KSU_SUSFS 系列符号，跳过这些配置项"
+            echo "（内核源码侧的 SUSFS 补丁已应用，功能由 KernelSU 内部自行探测）"
+            exit 0
+          fi
           cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
