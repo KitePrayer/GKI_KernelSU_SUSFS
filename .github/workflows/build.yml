@@ -72,6 +72,23 @@ on:
         type: boolean
         default: false
 
+      # ==================== 自定义内核源码 ====================
+      custom_kernel_source:
+        description: "自定义内核源码 git 地址（留空=用 AOSP GKI）。填了则跳过 repo sync，改用该仓库的 common/ 替换"
+        required: false
+        type: string
+        default: ""
+      custom_kernel_branch:
+        description: "自定义源码分支/tag/commit（留空=仓库默认分支）"
+        required: false
+        type: string
+        default: ""
+      custom_kernel_subdir:
+        description: "源码在仓库中的子目录（如 common/ ；根目录留空）"
+        required: false
+        type: string
+        default: ""
+
 jobs:
   build-kernel:
     name: "${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ inputs.ksu_variant }}"
@@ -296,6 +313,98 @@ jobs:
 
           $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast
           echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> $GITHUB_ENV
+
+      # ==================== 覆盖为自定义内核源码 ====================
+      # 思路：repo sync 已经把 build/ 和 prebuilts/ 这些构建引擎准备好了，
+      # 这里只把 common/ 换成自定义源码，保留其余部分。
+      # 这样既有完整 kleaf/bazel 构建体系，又能用上厂商内核源码。
+      - name: 应用自定义内核源码
+        if: inputs.custom_kernel_source != ''
+        working-directory: ${{ env.KERNEL_ROOT }}
+        env:
+          SRC_URL: ${{ inputs.custom_kernel_source }}
+          SRC_BRANCH: ${{ inputs.custom_kernel_branch }}
+          SRC_SUBDIR: ${{ inputs.custom_kernel_subdir }}
+        run: |
+          set -e
+          echo "[+] 自定义内核源码: $SRC_URL"
+          echo "    分支: ${SRC_BRANCH:-<仓库默认>}"
+          echo "    子目录: ${SRC_SUBDIR:-<根目录>}"
+
+          # 选 clone 参数：分支不存在时 git 会抛 exit 128，先自己校验，
+          # 并把该仓库真实可用的分支列出来，避免只看到一个裸错误码。
+          CLONE_ARGS=""
+          if [ -n "$SRC_BRANCH" ]; then
+            echo "[+] 校验 ref: $SRC_BRANCH"
+            if git ls-remote --exit-code --heads "$SRC_URL" "$SRC_BRANCH" >/dev/null 2>&1; then
+              echo "    分支存在"
+              CLONE_ARGS="--branch $SRC_BRANCH"
+            elif git ls-remote --exit-code --tags "$SRC_URL" "$SRC_BRANCH" >/dev/null 2>&1; then
+              echo "    tag 存在"
+              CLONE_ARGS="--branch $SRC_BRANCH"
+            else
+              echo "::error::ref '$SRC_BRANCH' 在该仓库中既不是分支也不是 tag"
+              echo "----- 该仓库现有分支 -----"
+              git ls-remote --heads "$SRC_URL" | sed 's#.*refs/heads/#  #' || true
+              echo "::error::请改填上面列出的分支名，或留空用仓库默认分支"
+              exit 1
+            fi
+          else
+            echo "[+] 未指定分支，使用仓库默认分支"
+          fi
+
+          # 浅克隆到临时目录（不叠加到 common/ 上，避免旧文件残留）
+          rm -rf /tmp/custom_kernel
+          git clone --depth 1 --single-branch $CLONE_ARGS "$SRC_URL" /tmp/custom_kernel
+
+          # 定位真正的内核源码根（Makefile 所在层）
+          CSRC=/tmp/custom_kernel
+          if [ -n "$SRC_SUBDIR" ]; then
+            CSRC=/tmp/custom_kernel/${SRC_SUBDIR%/}
+          fi
+          if [ ! -f "$CSRC/Makefile" ]; then
+            echo "::error::$CSRC 下没有 Makefile，无法作为内核源码"
+            echo "    仓库顶层："
+            ls -1 /tmp/custom_kernel | head -20
+            exit 1
+          fi
+          echo "[+] 自定义源码根: $CSRC"
+          echo "    版本: $(grep -m1 '^VERSION' "$CSRC/Makefile") $(grep -m1 '^PATCHLEVEL' "$CSRC/Makefile") $(grep -m1 '^SUBLEVEL' "$CSRC/Makefile")"
+
+          # 替换 common/：先备份 AOSP 的 common/（便于排查），再整体替换
+          echo "[+] 备份 AOSP common/ -> common.aosp.bak"
+          rm -rf common.aosp.bak
+          mv common common.aosp.bak
+          mkdir -p common
+          # 用 tar 管道复制，保留隐藏文件；不复制 .git 省空间
+          ( cd "$CSRC" && tar -cf - --exclude=.git . ) | ( cd common && tar -xf - )
+          echo "[+] common/ 已替换为自定义源码"
+          echo "    新 common/ 版本: $(grep -m1 '^SUBLEVEL' common/Makefile 2>/dev/null || echo 未知)"
+
+          # 自定义源码若自带 build.config.*（GKI 的 common 通常都有），
+          # 保持原样；构建仍走 build/build.sh + BUILD_CONFIG
+          if [ -f common/build.config.gki.aarch64 ]; then
+            echo "[+] 自定义源码自带 build.config.gki.aarch64，将使用它"
+          else
+            echo "::warning::自定义源码没有 build.config.gki.aarch64"
+            echo "           将回退用 AOSP 的那份"
+            cp common.aosp.bak/build.config.gki.aarch64 common/ 2>/dev/null || true
+          fi
+          # DEFCONFIG 在“初始化构建环境”步骤已写进 GITHUB_ENV，指向
+          # $KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig。
+          # 换掉 common/ 后要确认这个文件还在，否则后面全链路都会失败。
+          if [ ! -f "$GITHUB_WORKSPACE/$CONFIG/common/arch/arm64/configs/gki_defconfig" ]; then
+            echo "::error::替换后找不到 gki_defconfig"
+            echo "    期望: \$CONFIG/common/arch/arm64/configs/gki_defconfig"
+            echo "    实际 arch/arm64/configs 内容："
+            ls -1 "$GITHUB_WORKSPACE/$CONFIG/common/arch/arm64/configs" 2>/dev/null | head -20 || echo "    <目录不存在>"
+            exit 1
+          fi
+          echo "[+] gki_defconfig 存在: $CONFIG/common/arch/arm64/configs/gki_defconfig"
+
+          # 记录通用版本号（供后续步骤/日志用）
+          echo "CUSTOM_KERNEL_SRC=$SRC_URL" >> $GITHUB_ENV
+          echo "CUSTOM_KERNEL_USED=1" >> $GITHUB_ENV
 
       - name: 应用 Stock Config 伪装
         run: |
