@@ -46,6 +46,23 @@ on:
         type: string
         default: "r11"
 
+      # ==================== 自定义内核源码 ====================
+      custom_kernel_source:
+        description: "自定义内核源码 git 地址（留空=编译 AOSP GKI 原版）"
+        required: false
+        type: string
+        default: ""
+      custom_kernel_branch:
+        description: "源码分支/tag（留空=仓库默认分支，厂商仓库常为 master）"
+        required: false
+        type: string
+        default: ""
+      custom_kernel_subdir:
+        description: "源码在仓库中的子目录（如 common/ ；根目录留空）"
+        required: false
+        type: string
+        default: ""
+
       # ==================== KernelSU 配置 ====================
       kernelsu_variant:
         description: "KernelSU 变体"
@@ -146,6 +163,9 @@ jobs:
       enable_susfs: ${{ !inputs.cancel_susfs }}
       droidspaces: ${{ inputs.droidspaces || 'off' }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync || false }}
+      custom_kernel_source: ${{ inputs.custom_kernel_source || '' }}
+      custom_kernel_branch: ${{ inputs.custom_kernel_branch || '' }}
+      custom_kernel_subdir: ${{ inputs.custom_kernel_subdir || '' }}
 
   get-ksu-manager:
     uses: ./.github/workflows/get-manager.yml
