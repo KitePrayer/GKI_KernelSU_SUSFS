@@ -318,7 +318,22 @@ jobs:
           FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
           echo "初始化 repo，分支: common-${FORMATTED_BRANCH}"
 
-          $REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16
+          # manifest 分支不存在时要自己退一步，否则 repo init 会一直重试到超时。
+          # 注意：repo init 只认 manifest 仓库里真实存在的分支，
+          # os_patch_level 填新了（例如系统是 2026 年的补丁）会直接找不到。
+          # 这里把该系列所有可用分支列出来，供人选对。
+          MANIFEST_URL="https://android.googlesource.com/kernel/manifest"
+          if ! git ls-remote --exit-code --heads "$MANIFEST_URL" "common-${FORMATTED_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::manifest 里没有分支 common-${FORMATTED_BRANCH}"
+            echo "----- ${{ inputs.android_version }}-${{ inputs.kernel_version }} 可用分支（最新的几个）-----"
+            git ls-remote --heads "$MANIFEST_URL" "common-${{ inputs.android_version }}-${{ inputs.kernel_version }}-*" 2>/dev/null \
+              | sed 's#.*refs/heads/common-[0-9.]*-[0-9.]*-##' | sort -V | tail -12 | sed 's/^/  /'
+            echo "::error::请把 os_patch_level 改成上面列出的某个值（不要用系统补丁月份）"
+            exit 1
+          fi
+          echo "[+] manifest 分支存在"
+
+          $REPO init --depth=1 -u "$MANIFEST_URL" -b common-${FORMATTED_BRANCH} --repo-rev=v2.16
 
           REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
           DEFAULT_MANIFEST_PATH=.repo/manifests/default.xml
@@ -328,7 +343,16 @@ jobs:
             sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" $DEFAULT_MANIFEST_PATH
           fi
 
-          $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast
+          # 填了自定义源码时，common/ 稍后会被整个替换掉，没必要下载。
+          # 用 -x common 排除它，只拉 build/ 和 prebuilts/ 这些构建引擎。
+          if [ -n "${{ inputs.custom_kernel_source }}" ]; then
+            echo "[+] 已指定自定义内核源码，同步时排除 common 项目（省约 3GB）"
+            $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast -x common \
+              || { echo "::warning::排除 common 同步失败，退回全量同步"; \
+                   $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast; }
+          else
+            $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast
+          fi
           echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> $GITHUB_ENV
 
       # ==================== 覆盖为自定义内核源码 ====================
@@ -388,10 +412,16 @@ jobs:
           echo "[+] 自定义源码根: $CSRC"
           echo "    版本: $(grep -m1 '^VERSION' "$CSRC/Makefile") $(grep -m1 '^PATCHLEVEL' "$CSRC/Makefile") $(grep -m1 '^SUBLEVEL' "$CSRC/Makefile")"
 
-          # 替换 common/：先备份 AOSP 的 common/（便于排查），再整体替换
-          echo "[+] 备份 AOSP common/ -> common.aosp.bak"
-          rm -rf common.aosp.bak
-          mv common common.aosp.bak
+          # 替换 common/。
+          # 注意：前面 repo sync 若用了 -x common，这里就没有 AOSP 的 common/，
+          # 直接建新目录即可，不要 mv 一个不存在的目录（set -e 下会直接失败）。
+          if [ -d common ]; then
+            echo "[+] 备份 AOSP common/ -> common.aosp.bak"
+            rm -rf common.aosp.bak
+            mv common common.aosp.bak
+          else
+            echo "[+] 没有 AOSP common/（repo sync 已排除），直接使用自定义源码"
+          fi
           mkdir -p common
           # 用 tar 管道复制，保留隐藏文件；不复制 .git 省空间
           ( cd "$CSRC" && tar -cf - --exclude=.git . ) | ( cd common && tar -xf - )
@@ -404,8 +434,14 @@ jobs:
             echo "[+] 自定义源码自带 build.config.gki.aarch64，将使用它"
           else
             echo "::warning::自定义源码没有 build.config.gki.aarch64"
-            echo "           将回退用 AOSP 的那份"
-            cp common.aosp.bak/build.config.gki.aarch64 common/ 2>/dev/null || true
+            if [ -f common.aosp.bak/build.config.gki.aarch64 ]; then
+              echo "           回退用 AOSP 的那份"
+              cp common.aosp.bak/build.config.gki.aarch64 common/
+            else
+              echo "::error::AOSP common 也没同步（已被排除），无法提供 build.config.gki.aarch64"
+              echo "        请让自定义源码自带该文件，或不填 custom_kernel_source"
+              exit 1
+            fi
           fi
           # DEFCONFIG 在“初始化构建环境”步骤已写进 GITHUB_ENV，指向
           # $KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig。
