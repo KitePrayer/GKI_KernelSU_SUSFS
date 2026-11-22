@@ -106,6 +106,18 @@ on:
         type: string
         default: ""
 
+      # ==================== 厂商 vendor 源码（可选） ====================
+      custom_vendor_source:
+        description: "厂商 vendor 源码 git 地址。common 里有断链（如 kernel/oplus_cpu -> vendor/oplus/kernel/cpu）时必须填，否则 make 清理阶段就失败"
+        required: false
+        type: string
+        default: ""
+      custom_vendor_branch:
+        description: "vendor 源码分支（留空=仓库默认分支）"
+        required: false
+        type: string
+        default: ""
+
 jobs:
   build-kernel:
     name: "${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }}-${{ inputs.ksu_variant }}"
@@ -454,6 +466,91 @@ jobs:
             exit 1
           fi
           echo "[+] gki_defconfig 存在: $CONFIG/common/arch/arm64/configs/gki_defconfig"
+
+          # ---------- 部署厂商 vendor 源码 ----------
+          # realme/OPPO 的 common 里有大量断链，例如：
+          #   common/kernel/oplus_cpu        -> ../../../vendor/oplus/kernel/cpu
+          #   common/drivers/soc/oplus/storage -> ../../../../../vendor/oplus/kernel/storage
+          # 这些软链从 common/xxx/ 往上退到工作区根，指向 vendor/oplus/...。
+          # 而独立的 vendor 仓库（xxx-vendor-source）里正好有 kernel_platform/vendor/oplus。
+          # 不补上的话 make mrproper 会报：
+          #   No rule to make target '.../kernel/oplus_cpu/sched/sched_tune/Makefile'
+          VSRC_URL="${{ inputs.custom_vendor_source }}"
+          VSRC_BR="${{ inputs.custom_vendor_branch }}"
+          if [ -n "$VSRC_URL" ]; then
+            echo "[+] 部署厂商 vendor 源码: $VSRC_URL"
+            VCLONE=""
+            if [ -n "$VSRC_BR" ]; then
+              if git ls-remote --exit-code --heads "$VSRC_URL" "$VSRC_BR" >/dev/null 2>&1; then
+                VCLONE="--branch $VSRC_BR"
+              else
+                echo "::error::vendor 仓库没有分支 $VSRC_BR"
+                git ls-remote --heads "$VSRC_URL" | sed 's#.*refs/heads/#  #' || true
+                exit 1
+              fi
+            fi
+            rm -rf /tmp/custom_vendor
+            git clone --depth 1 --single-branch $VCLONE "$VSRC_URL" /tmp/custom_vendor
+
+            # vendor 仓库的结构是 kernel_platform/vendor/oplus/...
+            # 也可能直接在 vendor/oplus/...
+            VROOT=""
+            if [ -d /tmp/custom_vendor/kernel_platform/vendor ]; then
+              VROOT=/tmp/custom_vendor/kernel_platform/vendor
+            elif [ -d /tmp/custom_vendor/vendor ]; then
+              VROOT=/tmp/custom_vendor/vendor
+            fi
+            if [ -z "$VROOT" ]; then
+              echo "::error::vendor 仓库里没找到 vendor/ 或 kernel_platform/vendor/ 目录"
+              ls -1 /tmp/custom_vendor | head -20
+              exit 1
+            fi
+            echo "[+] vendor 源目录: $VROOT"
+
+            # 关键：软链是相对 common/ 里的位置往回退的，实测两个软链
+            #   common/kernel/oplus_cpu            -> ../../../vendor/oplus/kernel/cpu
+            #   common/drivers/soc/oplus/storage   -> ../../../../../vendor/oplus/kernel/storage
+            # 往上退完之后都落在 **$GITHUB_WORKSPACE**（不是 $KERNEL_ROOT），
+            # 所以 vendor/ 必须放到 $GITHUB_WORKSPACE/vendor。
+            WS_VENDOR="$GITHUB_WORKSPACE/vendor"
+            rm -rf "$WS_VENDOR"
+            cp -a "$VROOT" "$WS_VENDOR"
+            echo "[+] 已部署 vendor/ 到 $WS_VENDOR"
+            echo "    (= $WS_VENDOR)"
+            echo "    vendor/oplus/kernel/cpu 项数: $(ls -1 vendor/oplus/kernel/cpu 2>/dev/null | wc -l)"
+            echo "    vendor/oplus/kernel/storage 项数: $(ls -1 vendor/oplus/kernel/storage 2>/dev/null | wc -l)"
+
+            # 验证软链能解析（用 -e 判断，它对断链返回假）
+            BROKEN=0
+            for L in common/kernel/oplus_cpu common/drivers/soc/oplus/storage; do
+              if [ -L "$L" ]; then
+                if [ -e "$L" ]; then
+                  echo "    ok 软链可解析: $L -> $(readlink "$L")"
+                else
+                  echo "    [!] 断链: $L -> $(readlink "$L")"
+                  echo "        目标应为: $(cd "$(dirname "$L")" && cd "$(readlink "$L")" 2>/dev/null && pwd || echo '<不存在>')"
+                  BROKEN=$((BROKEN+1))
+                fi
+              fi
+            done
+            if [ "$BROKEN" -gt 0 ]; then
+              echo "::warning::仍有 $BROKEN 个断链，编译可能失败"
+            fi
+          else
+            # 没填 vendor 源时，检查 common 里有没有断链，提前告警
+            BROKEN=0
+            for L in $(find common -maxdepth 4 -type l 2>/dev/null | head -200); do
+              if [ ! -e "$L" ]; then
+                BROKEN=$((BROKEN+1))
+                [ "$BROKEN" -le 5 ] && echo "    [!] 断链: $L -> $(readlink "$L")"
+              fi
+            done
+            if [ "$BROKEN" -gt 0 ]; then
+              echo "::warning::common 里有 $BROKEN 个断链（多为指向 vendor/ 的软链）"
+              echo "           如果编译报 No rule to make target '.../oplus_*/Makefile'，"
+              echo "           请填 custom_vendor_source 指向厂商 vendor 源码仓库"
+            fi
+          fi
 
           # 记录通用版本号（供后续步骤/日志用）
           echo "CUSTOM_KERNEL_SRC=$SRC_URL" >> $GITHUB_ENV
