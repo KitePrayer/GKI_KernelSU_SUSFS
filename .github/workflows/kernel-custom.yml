@@ -62,6 +62,16 @@ on:
         required: false
         type: string
         default: ""
+      custom_vendor_source:
+        description: "厂商 vendor 源码 git 地址（必填：common 里有指向 vendor/oplus 的软链，不补会编译失败）"
+        required: false
+        type: string
+        default: ""
+      custom_vendor_branch:
+        description: "vendor 源码分支（留空=仓库默认分支）"
+        required: false
+        type: string
+        default: ""
 
       # ==================== KernelSU 配置 ====================
       kernelsu_variant:
@@ -187,6 +197,8 @@ jobs:
       custom_kernel_source: ${{ inputs.custom_kernel_source || '' }}
       custom_kernel_branch: ${{ inputs.custom_kernel_branch || '' }}
       custom_kernel_subdir: ${{ inputs.custom_kernel_subdir || '' }}
+      custom_vendor_source: ${{ inputs.custom_vendor_source || '' }}
+      custom_vendor_branch: ${{ inputs.custom_vendor_branch || '' }}
       nova_source: ${{ inputs.nova_source || 'SukiSU-Nova/SukiSU-Nova' }}
       nova_branch: ${{ inputs.nova_branch || 'main' }}
       nova_ref: ${{ inputs.nova_ref || '' }}
